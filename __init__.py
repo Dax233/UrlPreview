@@ -372,7 +372,7 @@ async def generate_x_snapshot(url: str) -> tuple:
                         media_paths.append(media_path)
                         i += 1
                     elif media_type == 'animated_gif':
-                        media_url = (media['video_info']['variants'])[i]['url']
+                        media_url = (media['video_info']['variants'])[0]['url']
                         media_path = await download_media(media_url, f'tweet_video_{i}.mp4')
                         media_paths.append(media_path)
                         i += 1
