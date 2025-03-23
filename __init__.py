@@ -8,6 +8,7 @@ from io import BytesIO
 import base64
 import os
 import re
+import subprocess
 from urllib.parse import urlparse, urlunparse
 from ..logger import model
 from .config import Config
@@ -15,7 +16,7 @@ from twikit import Client
 import httpx
 from PIL import Image, ImageDraw, ImageFont
 import asyncio
-
+import math
 
 __plugin_meta__ = PluginMetadata(
     name="WebsiteShortcut",
@@ -33,7 +34,10 @@ preview_cache = {}
 # 配置 Twikit 客户端并设置代理
 proxy = "http://127.0.0.1:7890"
 client = Client('en-US', proxy=proxy)
-
+proxies = {
+  'http': 'http://127.0.0.1:7890',
+  'https': 'http://127.0.0.1:7890',
+}
 
 def add_watermark(image_path, watermark_text="刻上属于你的痕迹", font_path="src/fonts/lolita.ttf"):
     base = Image.open(image_path).convert('RGBA')
@@ -84,6 +88,7 @@ async def handle_group_message(bot: Bot, event: Event):
     biliurl = False
     xurl = False
     eurl = False
+    dlurl = False
     if ('http' in message and '[CQ:json' in message) or ('http' in message and '[CQ:' not in message):
         url = extract_url(message)
         for i in bili_keyword:
@@ -99,6 +104,11 @@ async def handle_group_message(bot: Bot, event: Event):
                 eurl = True
                 break
 
+        if 'asmr.one' in url:
+            dlurl = True
+        if 'dlsite.com' in url:
+            dlurl = True
+
         if biliurl:
             snapshot, image_path = await generate_bilibili_snapshot(url)
 
@@ -109,7 +119,7 @@ async def handle_group_message(bot: Bot, event: Event):
             if media_paths:
                 respone = ''
                 for media_path in media_paths:
-                    if media_path.endswith('.jpg'):
+                    if media_path.endswith('.jpg') or media_path.endswith('.png'):
                         add_watermark(media_path)
                         parts = media_path.split('.')
                         if parts[1] == 'jpeg' or parts[1] == 'jpg':
@@ -128,6 +138,12 @@ async def handle_group_message(bot: Bot, event: Event):
 
         elif eurl:
             return
+        elif dlurl:
+            snapshot, image_path = await generate_dlsite_snapshot(url)
+            if snapshot == None:
+                snapshot, image_path = await generate_snapshot(url)
+                if snapshot == None:
+                    return
         else:
             snapshot, image_path = await generate_snapshot(url)
             if snapshot == None:
@@ -146,6 +162,20 @@ def extract_links(text):
     # 查找所有匹配的URL
     links = re.findall(pattern, text)
     return links[0]
+
+def generate_star_rating(rating):
+    if rating == 'N/A':
+        return 'N/A'
+    
+    # 四舍五入到最近的半星
+    rounded_rating = round(float(rating) * 2) / 2
+    full_stars = int(rounded_rating)
+    half_star = int((rounded_rating - full_stars) * 2)
+    
+    # 生成星星字符串
+    star_rating = '★' * full_stars + '☆' * (5 - full_stars - half_star) + '★' * half_star
+    return star_rating
+
 
 def access_b23_url_and_return_real_url(url):
     res = requests.head(url, allow_redirects=True)
@@ -204,6 +234,92 @@ async def login():
             xlogin = False
             print(f"Error login x: {e}")
 
+def fetch_dlsite_data(product_id, headers):
+    url = f'https://www.dlsite.com/maniax/product/info/ajax?product_id={product_id}&cdn_cache_min=1'
+    response = requests.get(url, headers=headers, proxies=proxies)
+    if response.status_code == 200:
+        data = response.json()
+        product_data = data.get(product_id, {})
+        if product_data["translation_info"]["original_workno"] != None:
+            product_id = product_data["translation_info"]["original_workno"]
+
+    url = f'https://www.dlsite.com/maniax/product/info/ajax?product_id={product_id}&cdn_cache_min=1'
+    response = requests.get(url, headers=headers, proxies=proxies)
+    if response.status_code == 200:
+        data = response.json()
+        product_data = data.get(product_id, {})
+        
+        total_sales = product_data['dl_count_total']
+        if total_sales == 0:
+            total_sales = product_data['dl_count']
+        average_rating = product_data['rate_average_2dp']
+        wishlist_counts = product_data['wishlist_count']
+        # 生成星星字符串
+        if average_rating != None:
+            star_rating = generate_star_rating(average_rating)
+            midresp = f"{star_rating} ({average_rating})"
+        else:
+            midresp = f"未发售，暂无评分。\n发售日期：{product_data['regist_date']}"
+
+        return total_sales, midresp, wishlist_counts
+    else:
+        print(f"请求失败，状态码: {response.status_code}")
+        return None, None, None
+
+async def generate_dlsite_snapshot(url: str) -> tuple:
+    # Extract RJ number from the input URL
+    match = re.search(r'RJ\d+', url)
+    if not match:
+        return None, None
+    
+    rj_number = match.group(0)
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36',
+        'cookies': config.cookies
+    }
+
+    # 获取额外数据（销量、收藏数、评价数）
+    sales, reviews, favorites = fetch_dlsite_data(rj_number, headers)
+    if sales == None:
+        return None, None
+
+    dlsite_url = f'https://www.dlsite.com/maniax/work/=/product_id/{rj_number}.html?locale=zh_CN'
+    
+    response = requests.get(dlsite_url, headers=headers, proxies=proxies)
+    if response.status_code != 200:
+        return None, None
+    
+    soup = BeautifulSoup(response.content, 'html.parser')
+    
+    title = soup.find('h1', attrs={'itemprop': 'name','id': 'work_name'}).text.strip()
+    if title == '无标题' or title == 'None':
+        return None, None
+    
+    title = f"【{rj_number}】" + title
+
+    # 尝试获取<meta>标签中的description
+    description = soup.find('meta', attrs={'property': 'og:description'})
+    if description and description.get('content'):
+        content = truncate_repeated_chars(description['content'][:100] + '...' ) 
+    else:
+        content = truncate_repeated_chars(soup.get_text()[:100] + '...' )  # 获取前100个字符作为摘要
+
+    # 获取图片 URL
+    image_url = None
+    og_image = soup.find('meta', attrs={'property': 'og:image'})
+    if og_image and og_image.get('content'):
+        image_url = og_image['content']
+    
+    snapshot = f"{title}\n总销量: {sales}\n收藏数: {favorites}\n评分: {reviews}\n介绍：{content}"
+    image_path = None
+    
+    if image_url:
+        image_url = ensure_http_scheme(image_url)
+        image_path = await download_image(image_url, headers, 'snapshot_image.jpg')
+
+    return snapshot, image_path
+
 async def generate_bilibili_snapshot(url: str) -> tuple:
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36'
@@ -248,7 +364,7 @@ async def generate_bilibili_snapshot(url: str) -> tuple:
             try:
                 image = Image.open(BytesIO(image_response.content))
                 image = image.convert('RGB')  # 转换为RGB模式
-                image_path = os.path.abspath('src\\plugins\\websiteshortcut\\' + 'bilibili_cover.jpg')
+                image_path = os.path.abspath(config.src_folder + 'bilibili_cover.jpg')
                 image.save(image_path, format='JPEG')
             except Exception as e:
                 print(f"Error processing image: {e}")
@@ -368,7 +484,12 @@ async def generate_x_snapshot(url: str) -> tuple:
                         media_paths.append(media_path)
                         i += 1
                     elif media_type == 'video':
-                        media_path = await download_media(media_url, f'tweet_video_{i}.mp4')
+                        media_url = (media['video_info']['variants'])[0]['url']
+                        if ".m3u8" in media_url:
+                            media_path = os.path.abspath(config.src_folder + f'tweet_video_{i}.mp4')
+                            convert_m3u8_to_mp4(media_url, media_path)
+                        else:
+                            media_path = await download_media(media_url, f'tweet_video_{i}.mp4')
                         media_paths.append(media_path)
                         i += 1
                     elif media_type == 'animated_gif':
@@ -388,7 +509,7 @@ async def download_media(url: str, filename: str) -> str:
     try:
         response = requests.get(url)
         if response.status_code == 200:
-            media_path = os.path.abspath('src\\plugins\\websiteshortcut\\' + filename)
+            media_path = os.path.abspath(config.src_folder + filename)
             with open(media_path, 'wb') as file:
                 file.write(response.content)
             return media_path
@@ -405,15 +526,27 @@ async def download_image(url: str, headers: dict, filename: str) -> str:
         if response.status_code == 200 and 'image' in response.headers['Content-Type']:
             image = Image.open(BytesIO(response.content))
             image = image.convert('RGB')  # 转换为RGB模式
-            image_path = os.path.abspath('src\\plugins\\websiteshortcut\\' + filename)
+            image_path = os.path.abspath(config.src_folder + filename)
             image.save(image_path, format='JPEG')
             return image_path
         else:
             print(f"Invalid image MIME type or status code: {response.status_code}, {response.headers['Content-Type']}")
             return None
-    except Exception as e:
-        print(f"Error processing image: {e}")
-        return None
+    except:
+        try:
+            response = requests.get(url, headers=headers, proxies=proxies)
+            if response.status_code == 200 and 'image' in response.headers['Content-Type']:
+                image = Image.open(BytesIO(response.content))
+                image = image.convert('RGB')  # 转换为RGB模式
+                image_path = os.path.abspath(config.src_folder + filename)
+                image.save(image_path, format='JPEG')
+                return image_path
+            else:
+                print(f"Invalid image MIME type or status code: {response.status_code}, {response.headers['Content-Type']}")
+                return None
+        except Exception as e:
+            print(f"Error processing image: {e}")
+            return None
 
 async def image_url_to_base64(url: str, headers: dict) -> str:
     try:
@@ -429,3 +562,13 @@ async def image_url_to_base64(url: str, headers: dict) -> str:
 
 xlogin = False
 asyncio.run(login())
+
+def convert_m3u8_to_mp4(m3u8_file, output_file):
+    command = [
+        'ffmpeg',
+        '-y',
+        '-i', m3u8_file,
+        '-c', 'copy',
+        output_file
+    ]
+    subprocess.run(command)
