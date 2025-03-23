@@ -7,3 +7,5 @@ class Config(BaseModel):
     X_USERNAME: str = ''
     X_EMAIL: str = ''
     X_PASSWORD: str = ''
+    src_folder: str = f'src\\data\\websiteshortcut\\'
+    cookies: str = ''
